@@ -200,14 +200,14 @@ jobs:
           
           # Run Claude Code in headless mode with stream-json output
           claude \
-            --model claude-haiku-4-5 \
+            --model "${ANTHROPIC_DEFAULT_SONNET_MODEL:-~anthropic/claude-sonnet-latest}" \
             --output-format stream-json \
             -p "$PCI_PROMPT" \
             2>/dev/null \
             | python3 -c "
           import sys, json
 
-          # Parse stream-json events to extract the final text content
+          # Parse stream-json events (Claude Code 2.x format)
           result_text = ''
           for line in sys.stdin:
               line = line.strip()
@@ -215,8 +215,17 @@ jobs:
                   continue
               try:
                   event = json.loads(line)
-                  # Extract content from stream events
-                  if event.get('type') == 'content_block_delta':
+                  # Claude Code 2.x: final result in 'result' field
+                  if event.get('type') == 'result' and event.get('subtype') == 'success':
+                      result_text = event.get('result', '')
+                      break
+                  # Claude Code 2.x: assistant message
+                  elif event.get('type') == 'assistant':
+                      for block in event.get('message', {}).get('content', []):
+                          if block.get('type') == 'text':
+                              result_text += block.get('text', '')
+                  # Legacy 1.x format
+                  elif event.get('type') == 'content_block_delta':
                       delta = event.get('delta', {})
                       if delta.get('type') == 'text_delta':
                           result_text += delta.get('text', '')
@@ -346,95 +355,81 @@ jobs:
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
           echo "📊 PR diff: $DIFF_LINES lines"
 
-      # ── Step 6: Claude-as-Judge compliance scoring ────────────────────────
+      # ── Step 6: Claude-as-Judge compliance scoring (OpenRouter) ─────────────
       - name: "🏛️ Claude-as-Judge: Score compliance quality"
         id: compliance-judge
         run: |
           mkdir -p ci_reports
-          
-          # The Claude-as-Judge rubric for BFSI banking platform compliance
-          JUDGE_PROMPT="You are a senior banking compliance officer acting as a code review judge.
-          
-          Score this pull request on a 1-5 compliance quality rubric for a PCI DSS-regulated banking platform.
-          
-          SCORING RUBRIC:
-          
-          5/5 - EXCELLENT:
-          - All sensitive data properly masked/encrypted
-          - Complete audit logging for all financial operations  
-          - Input validation on all user-provided data
-          - No hardcoded credentials or secrets
-          - Proper error handling without information leakage
-          - Code follows all CLAUDE.md PCI DSS standards
-          
-          4/5 - GOOD (MEETS GATE THRESHOLD):
-          - Sensitive data handling is correct
-          - Audit logging present for key operations
-          - Minor improvements possible but no compliance risks
-          - Follows most PCI DSS standards from CLAUDE.md
-          
-          3/5 - ADEQUATE (BELOW THRESHOLD — GATE FAILS):
-          - Some gaps in data protection
-          - Incomplete audit trail
-          - Some missing input validation
-          - Needs remediation before merging
-          
-          2/5 - POOR (GATE FAILS):
-          - Significant compliance gaps
-          - Missing required security controls
-          - High risk of PCI DSS violation in production
-          
-          1/5 - CRITICAL FAILURE (GATE FAILS):
-          - Active PCI DSS violations
-          - Data exposed or security controls bypassed
-          - Must not be merged under any circumstances
-          
-          PULL REQUEST METADATA:
-          - PR #${{ github.event.pull_request.number }}
-          - Title: ${{ github.event.pull_request.title }}
-          - Author: ${{ github.event.pull_request.user.login }}
-          
-          CODE CHANGES TO REVIEW:
-          $(cat ci_reports/full_diff.patch | head -400)
-          
-          Respond with ONLY this JSON structure, no other text:
-          {
-            \"score\": <integer 1-5>,
-            \"grade\": \"EXCELLENT|GOOD|ADEQUATE|POOR|CRITICAL_FAILURE\",
-            \"gate_decision\": \"PASS|FAIL\",
-            \"strengths\": [\"strength 1\", \"strength 2\"],
-            \"improvements_required\": [\"improvement 1\"],
-            \"improvements_suggested\": [\"suggestion 1\"],
-            \"pci_dss_notes\": \"Brief note on PCI DSS compliance\",
-            \"reviewer_summary\": \"2-3 sentence summary for PR author\"
-          }"
-          
-          # Run Claude-as-Judge in headless mode
-          claude \
-            --model claude-sonnet-4-5 \
-            --output-format stream-json \
-            -p "$JUDGE_PROMPT" \
-            2>/dev/null \
-            | python3 -c "
-          import sys, json
 
-          result_text = ''
-          for line in sys.stdin:
-              line = line.strip()
-              if not line:
-                  continue
-              try:
-                  event = json.loads(line)
-                  if event.get('type') == 'content_block_delta':
-                      delta = event.get('delta', {})
-                      if delta.get('type') == 'text_delta':
-                          result_text += delta.get('text', '')
-              except json.JSONDecodeError:
-                  continue
-          print(result_text)
-          " > ci_reports/compliance_score.json 2>/dev/null \
-            || echo '{\"score\": 0, \"grade\": \"ERROR\", \"gate_decision\": \"FAIL\", \"reviewer_summary\": \"Scoring failed — manual review required\"}' > ci_reports/compliance_score.json
-          
+          python3 - << 'PYTHON_SCRIPT'
+          import json, os, re, sys, urllib.request, urllib.error
+
+          try:
+              with open("ci_reports/full_diff.patch") as f:
+                  diff_content = f.read()[:10000]
+          except Exception:
+              diff_content = "(no diff available)"
+
+          prompt = (
+              "You are a senior banking compliance officer acting as a code review judge.\n\n"
+              "Score this pull request on a 1-5 compliance quality rubric for a "
+              "PCI DSS-regulated banking platform.\n\n"
+              "SCORING RUBRIC:\n\n"
+              "5/5 - EXCELLENT: All sensitive data masked, complete audit logging, "
+              "input validation, no hardcoded credentials, proper error handling, "
+              "follows CLAUDE.md PCI DSS standards.\n\n"
+              "4/5 - GOOD (MEETS GATE THRESHOLD): Correct sensitive data handling, "
+              "audit logging present for key operations, minor improvements possible "
+              "but no compliance risks, follows most PCI DSS standards.\n\n"
+              "3/5 - ADEQUATE (BELOW THRESHOLD): Some data protection gaps, "
+              "incomplete audit trail, some missing input validation.\n\n"
+              "2/5 - POOR: Significant compliance gaps, missing security controls, "
+              "high risk of PCI DSS violation.\n\n"
+              "1/5 - CRITICAL FAILURE: Active PCI DSS violations, "
+              "data exposed or security controls bypassed.\n\n"
+              "CODE CHANGES TO REVIEW:\n"
+              + diff_content
+              + "\n\nRespond with ONLY valid JSON, no other text:\n"
+              "{\"score\":<int 1-5>,\"grade\":\"EXCELLENT|GOOD|ADEQUATE|POOR|CRITICAL_FAILURE\","
+              "\"gate_decision\":\"PASS|FAIL\",\"strengths\":[\"...\"],"
+              "\"improvements_required\":[],\"improvements_suggested\":[\"...\"],"
+              "\"pci_dss_notes\":\"...\",\"reviewer_summary\":\"...\"}"
+          )
+
+          try:
+              payload = json.dumps({
+                  "model": "anthropic/claude-sonnet-4-5",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 1024,
+              }).encode()
+              req = urllib.request.Request(
+                  "https://openrouter.ai/api/v1/chat/completions",
+                  data=payload,
+                  headers={
+                      "Authorization": "Bearer " + os.environ.get("OPENROUTER_API_KEY", ""),
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
+              )
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              result_text = body["choices"][0]["message"]["content"].strip()
+              json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+              if json_match:
+                  data = json.loads(json_match.group())
+              else:
+                  data = {"score": 0, "grade": "PARSE_ERROR", "gate_decision": "FAIL",
+                          "reviewer_summary": "Failed to parse JSON from model response",
+                          "raw": result_text[:300]}
+          except Exception as exc:
+              data = {"score": 0, "grade": "API_ERROR", "gate_decision": "FAIL",
+                      "reviewer_summary": str(exc)[:300]}
+
+          with open("ci_reports/compliance_score.json", "w") as f:
+              json.dump(data, f, indent=2)
+          print("Score: {}/5 - {}".format(data.get("score", 0), data.get("grade", "UNKNOWN")))
+          PYTHON_SCRIPT
+
           # Extract score and decision
           SCORE=$(python3 -c "
           import json
@@ -445,7 +440,7 @@ jobs:
           except:
               print(0)
           ")
-          
+
           GRADE=$(python3 -c "
           import json
           try:
@@ -455,7 +450,7 @@ jobs:
           except:
               print('UNKNOWN')
           ")
-          
+
           SUMMARY=$(python3 -c "
           import json
           try:
@@ -465,10 +460,10 @@ jobs:
           except:
               print('Scoring failed')
           ")
-          
+
           echo "compliance_score=$SCORE" >> $GITHUB_OUTPUT
           echo "compliance_grade=$GRADE" >> $GITHUB_OUTPUT
-          
+
           echo "🏛️ Claude-as-Judge Results:"
           echo "  Score:    $SCORE / 5"
           echo "  Grade:    $GRADE"
