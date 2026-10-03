@@ -355,15 +355,14 @@ jobs:
           echo "diff_lines=$DIFF_LINES" >> $GITHUB_OUTPUT
           echo "📊 PR diff: $DIFF_LINES lines"
 
-      # ── Step 6: Claude-as-Judge compliance scoring (Python SDK) ─────────────
+      # ── Step 6: Claude-as-Judge compliance scoring (OpenRouter) ─────────────
       - name: "🏛️ Claude-as-Judge: Score compliance quality"
         id: compliance-judge
         run: |
           mkdir -p ci_reports
-          pip install anthropic --quiet
 
           python3 - << 'PYTHON_SCRIPT'
-          import anthropic, json, os, re, sys
+          import json, os, re, sys, urllib.request, urllib.error
 
           try:
               with open("ci_reports/full_diff.patch") as f:
@@ -398,16 +397,23 @@ jobs:
           )
 
           try:
-              client = anthropic.Anthropic(
-                  base_url="https://openrouter.ai/api/v1",
-                  api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+              payload = json.dumps({
+                  "model": "anthropic/claude-sonnet-4-5",
+                  "messages": [{"role": "user", "content": prompt}],
+                  "max_tokens": 1024,
+              }).encode()
+              req = urllib.request.Request(
+                  "https://openrouter.ai/api/v1/chat/completions",
+                  data=payload,
+                  headers={
+                      "Authorization": "Bearer " + os.environ.get("OPENROUTER_API_KEY", ""),
+                      "Content-Type": "application/json",
+                  },
+                  method="POST",
               )
-              response = client.messages.create(
-                  model="anthropic/claude-sonnet-4.5",
-                  max_tokens=1024,
-                  messages=[{"role": "user", "content": prompt}],
-              )
-              result_text = response.content[0].text.strip()
+              with urllib.request.urlopen(req, timeout=60) as resp:
+                  body = json.loads(resp.read())
+              result_text = body["choices"][0]["message"]["content"].strip()
               json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
               if json_match:
                   data = json.loads(json_match.group())
