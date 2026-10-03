@@ -200,14 +200,14 @@ jobs:
           
           # Run Claude Code in headless mode with stream-json output
           claude \
-            --model claude-haiku-4-5 \
+            --model "${ANTHROPIC_DEFAULT_SONNET_MODEL:-~anthropic/claude-sonnet-latest}" \
             --output-format stream-json \
             -p "$PCI_PROMPT" \
             2>/dev/null \
             | python3 -c "
           import sys, json
 
-          # Parse stream-json events to extract the final text content
+          # Parse stream-json events (Claude Code 2.x format)
           result_text = ''
           for line in sys.stdin:
               line = line.strip()
@@ -215,8 +215,17 @@ jobs:
                   continue
               try:
                   event = json.loads(line)
-                  # Extract content from stream events
-                  if event.get('type') == 'content_block_delta':
+                  # Claude Code 2.x: final result in 'result' field
+                  if event.get('type') == 'result' and event.get('subtype') == 'success':
+                      result_text = event.get('result', '')
+                      break
+                  # Claude Code 2.x: assistant message
+                  elif event.get('type') == 'assistant':
+                      for block in event.get('message', {}).get('content', []):
+                          if block.get('type') == 'text':
+                              result_text += block.get('text', '')
+                  # Legacy 1.x format
+                  elif event.get('type') == 'content_block_delta':
                       delta = event.get('delta', {})
                       if delta.get('type') == 'text_delta':
                           result_text += delta.get('text', '')
@@ -409,9 +418,9 @@ jobs:
             \"reviewer_summary\": \"2-3 sentence summary for PR author\"
           }"
           
-          # Run Claude-as-Judge in headless mode
+          # Run Claude-as-Judge in headless mode (Claude Code 2.x)
           claude \
-            --model claude-sonnet-4-5 \
+            --model "${ANTHROPIC_DEFAULT_SONNET_MODEL:-~anthropic/claude-sonnet-latest}" \
             --output-format stream-json \
             -p "$JUDGE_PROMPT" \
             2>/dev/null \
@@ -425,7 +434,17 @@ jobs:
                   continue
               try:
                   event = json.loads(line)
-                  if event.get('type') == 'content_block_delta':
+                  # Claude Code 2.x: final result in 'result' field
+                  if event.get('type') == 'result' and event.get('subtype') == 'success':
+                      result_text = event.get('result', '')
+                      break
+                  # Claude Code 2.x: assistant message
+                  elif event.get('type') == 'assistant':
+                      for block in event.get('message', {}).get('content', []):
+                          if block.get('type') == 'text':
+                              result_text += block.get('text', '')
+                  # Legacy 1.x format
+                  elif event.get('type') == 'content_block_delta':
                       delta = event.get('delta', {})
                       if delta.get('type') == 'text_delta':
                           result_text += delta.get('text', '')
